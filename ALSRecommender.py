@@ -1,5 +1,6 @@
 # Importing Libraries
 import os
+import json
 import argparse
 import time
 import gc
@@ -9,203 +10,53 @@ from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.ml.recommendation import ALS
 
 class ALSRecommender:
-# ALSRecoommnder utilised Alternating Least Square Matric Factorisation - collaborative filtering to provide recommendations
+# ALSRecommender utilised Alternating Least Square Matric Factorisation
+# collaborative filtering to provide recommendations
 
-  def __init__(self, spark_session, shopData, ratings):
-  # shopData: The file containing collection of clothes we have in our database
-  # ratings: The file containing user's ratings of the ShopData items
-        self.spark = spark_session
-        self.sc = spark_session.sparkContext
-        self.moviesDF = self._load_file(shopData) \
-            .select(['productId', 'productName'])
-        self.ratingsDF = self._load_file(ratings) \
-            .select(['userID', 'productID', 'rating'])
-        self.model = ALS(
-            userCol='userId',
-            itemCol='productId',
-            ratingCol='rating',
-            coldStartStrategy="drop"
-            
-  def _load_file(self, filepath):
-  # load csv file into memory as spark DF
-       return self.spark.read.load(filepath, format='csv',
-                              header=True, inferSchema=True)
-                              
-  def tune_model(self, maxIter, regParams, ranks, split_ratio=(6, 2, 2)):
-      """
-      Hyperparameter tuning for ALS model
-      Parameters
-      ----------
-      maxIter: int, max number of learning iterations
-      regParams: list of float, regularization parameter
-      ranks: list of float, number of latent factors
-      split_ratio: tuple, (train, validation, test)
-      """
-      # split data
-      train, val, test = self.ratingsDF.randomSplit(split_ratio)
-      # holdout tuning
-      self.model = tune_ALS(self.model, train, val,
-                            maxIter, regParams, ranks)
-      # test model
-      predictions = self.model.transform(test)
-      evaluator = RegressionEvaluator(metricName="rmse",
-                                      labelCol="rating",
-                                      predictionCol="prediction")
-      rmse = evaluator.evaluate(predictions)
-      print('The out-of-sample RMSE of the best tuned model is:', rmse)
-      # clean up
-      del train, val, test, predictions, evaluator
-      gc.collect()
-      
-  def set_model_params(self, maxIter, regParam, rank):
-    """
-    set model params for pyspark.ml.recommendation.ALS
-    Parameters
-    ----------
-    maxIter: int, max number of learning iterations
-    regParams: float, regularization parameter
-    ranks: float, number of latent factors
-    """
-    self.model = self.model \
-        .setMaxIter(maxIter) \
-        .setRank(rank) \
-        .setRegParam(regParam)
-        
-    def _regex_matching(self, fav_movie):
-        """
-        return the closest matches via SQL regex.
-        If no match found, return None
-        Parameters
-        ----------
-        fav_movie: str, name of user input movie
-        Return
-        ------
-        list of indices of the matching movies
-        """
-        print('You have input movie:', fav_movie)
-        matchesDF = self.moviesDF \
-            .filter(
-                lower(
-                    col('title')
-                ).like('%{}%'.format(fav_movie.lower()))
-            ) \
-            .select('movieId', 'title')
-        if not len(matchesDF.take(1)):
-            print('Oops! No match is found')
-        else:
-            movieIds = matchesDF.rdd.map(lambda r: r[0]).collect()
-            titles = matchesDF.rdd.map(lambda r: r[1]).collect()
-            print('Found possible matches in our database: '
-                  '{0}\n'.format([x for x in titles]))
-            return movieIds
+    def __init__(self, spark_session, shopData, ratings):
+            # shopData: The file containing collection of clothes we have in our database
+            # ratings: The file containing user's ratings of the ShopData items
+            self.spark = spark_session
+            self.sc = spark_session.sparkContext
+            self.shopDataDF = self._load_file(shopData).select(['productId', 'tags'])
+            self.userDataDF = self.load_file(userData).select(['userId', 'preferences'])
+            # Create a temporary ratings file based on tags and preferences which will contain userId, productId and rating
+            self.ratingsDF = self.load_file(create_ratings_file(shopDataDF, userDataDF))
+            self.model = ALS(
+                userCol='userId',
+                itemCol='productId',
+                ratingCol='rating',
+                coldStartStrategy="drop"
 
-    def _append_ratings(self, userId, movieIds):
-        """
-        append a user's movie ratings to ratingsDF
-        Parameter
-        ---------
-        userId: int, userId of a user
-        movieIds: int, movieIds of user's favorite movies
-        """
-        # create new user rdd
-        user_rdd = self.sc.parallelize(
-            [(userId, movieId, 5.0) for movieId in movieIds])
-        # transform to user rows
-        user_rows = user_rdd.map(
-            lambda x: Row(
-                userId=int(x[0]),
-                movieId=int(x[1]),
-                rating=float(x[2])
-            )
-        )
-        # transform rows to spark DF
-        userDF = self.spark.createDataFrame(user_rows) \
-            .select(self.ratingsDF.columns)
-        # append to ratingsDF
-        self.ratingsDF = self.ratingsDF.union(userDF)
+    def _load_file(self, filepath):
+          # load json file into memory as spark DF
+           return self.spark.read.load(filepath, format='json', header=True, inferSchema=True)
 
-    def _create_inference_data(self, userId, movieIds):
-        """
-        create a user with all movies except ones were rated for inferencing
-        """
-        # filter movies
-        other_movieIds = self.moviesDF \
-            .filter(~col('movieId').isin(movieIds)) \
-            .select(['movieId']) \
-            .rdd.map(lambda r: r[0]) \
-            .collect()
-        # create inference rdd
-        inferenceRDD = self.sc.parallelize(
-            [(userId, movieId) for movieId in other_movieIds]
-        ).map(
-            lambda x: Row(
-                userId=int(x[0]),
-                movieId=int(x[1]),
-            )
-        )
-        # transform to inference DF
-        inferenceDF = self.spark.createDataFrame(inferenceRDD) \
-            .select(['userId', 'movieId'])
-        return inferenceDF
-
-    def _inference(self, model, fav_movie, n_recommendations):
-        """
-        return top n movie recommendations based on user's input movie
-        Parameters
-        ----------
-        model: spark ALS model
-        fav_movie: str, name of user input movie
-        n_recommendations: int, top n recommendations
-        Return
-        ------
-        list of top n similar movie recommendations
-        """
-        # create a userId
-        userId = self.ratingsDF.agg({"userId": "max"}).collect()[0][0] + 1
-        # get movieIds of favorite movies
-        movieIds = self._regex_matching(fav_movie)
-        # append new user with his/her ratings into data
-        self._append_ratings(userId, movieIds)
-        # matrix factorization
-        model = model.fit(self.ratingsDF)
-        # get data for inferencing
-        inferenceDF = self._create_inference_data(userId, movieIds)
-        # make inference
-        return model.transform(inferenceDF) \
-            .select(['movieId', 'prediction']) \
-            .orderBy('prediction', ascending=False) \
-            .rdd.map(lambda r: (r[0], r[1])) \
-            .take(n_recommendations)
-
-    def make_recommendations(self, fav_movie, n_recommendations):
-        """
-        make top n movie recommendations
-        Parameters
-        ----------
-        fav_movie: str, name of user input movie
-        n_recommendations: int, top n recommendations
-        """
-        # make inference and get raw recommendations
-        print('Recommendation system start to make inference ...')
-        t0 = time.time()
-        raw_recommends = \
-            self._inference(self.model, fav_movie, n_recommendations)
-        movieIds = [r[0] for r in raw_recommends]
-        scores = [r[1] for r in raw_recommends]
-        print('It took my system {:.2f}s to make inference \n\
-              '.format(time.time() - t0))
-        # get movie titles
-        movie_titles = self.moviesDF \
-            .filter(col('movieId').isin(movieIds)) \
-            .select('title') \
-            .rdd.map(lambda r: r[0]) \
-            .collect()
-        # print recommendations
-        print('Recommendations for {}:'.format(fav_movie))
-        for i in range(len(movie_titles)):
-            print('{0}: {1}, with rating '
-                  'of {2}'.format(i+1, movie_titles[i], scores[i]))
-
+    def create_ratings_file(shopDataDF, userDataDF):
+        """ Need help here to create a json file """
+        #create empty json ratings file
+        data = {}
+        #keep adding ratings per (user, product) in the file
+        userCol = userDataDF.select('userId')
+        productCol = shopDataDF.select('productId')
+        preference = userDataDF.select('preferences')
+        tag = shopDataDF.select('tags')
+        #Once number of users increase, we will have to find another way to create this file
+        for (user: userCol):
+            for (product: productCol):
+                for (tag: tags):
+                    #we can improve this rating later for sure
+                    # if tag is equal to preference, then make the rating equal to 1
+                    # if par of tag is equal to preference, then the rating is the same fraction
+                    # otherwise zero
+                    if ():
+                        rating = 1
+                    else():
+                        rating = 0
+                    #add user, product, rating in the data dictionary
+                    #data[user] = {product, rating}
+        ratings_data = json.dumps(data)
+        return ratings_data
 
 class Dataset:
     """
@@ -233,9 +84,8 @@ class Dataset:
     def load_file_as_DF(self, filepath):
         ratings_RDD = self.load_file_as_rdd(filepath)
         ratingsRDD = ratings_RDD.map(lambda tokens: Row(
-            userId=int(tokens[0]), movieId=int(tokens[1]), rating=float(tokens[2]))) # noqa
+            userId=int(tokens[0]), productId=int(tokens[1]), rating=float(tokens[2]))) # noqa
         return self.spark.createDataFrame(ratingsRDD)
-
 
 def tune_ALS(model, train_data, validation_data, maxIter, regParams, ranks):
     """
@@ -244,8 +94,8 @@ def tune_ALS(model, train_data, validation_data, maxIter, regParams, ranks):
     Parameters
     ----------
     model: spark ML model, ALS
-    train_data: spark DF with columns ['userId', 'movieId', 'rating']
-    validation_data: spark DF with columns ['userId', 'movieId', 'rating']
+    train_data: spark DF with columns ['userId', 'productId', 'rating']
+    validation_data: spark DF with columns ['userId', 'productId', 'rating']
     maxIter: int, max number of learning iterations
     regParams: list of float, one dimension of hyper-param tuning grid
     ranks: list of float, one dimension of hyper-param tuning grid
@@ -281,21 +131,20 @@ def tune_ALS(model, train_data, validation_data, maxIter, regParams, ranks):
           'regularization = {}'.format(best_rank, best_regularization))
     return best_model
 
-
 def parse_args():
     parser = argparse.ArgumentParser(
-        prog="Movie Recommender",
-        description="Run ALS Movie Recommender")
-    parser.add_argument('--path', nargs='?', default='../data/MovieLens',
+        prog="Products Recommender",
+        description="Run ALS Product Recommender")
+    parser.add_argument('--path', nargs='?', default='../data/productLens',
                         help='input data path')
-    parser.add_argument('--movies_filename', nargs='?', default='movies.csv',
-                        help='provide movies filename')
+    parser.add_argument('--shopData_filename', nargs='?', default='products.csv',
+                        help='provide product filename')
     parser.add_argument('--ratings_filename', nargs='?', default='ratings.csv',
                         help='provide ratings filename')
-    parser.add_argument('--movie_name', nargs='?', default='',
-                        help='provide your favoriate movie name')
-    parser.add_argument('--top_n', type=int, default=10,
-                        help='top n movie recommendations')
+    parser.add_argument('--product_name', nargs='?', default='',
+                        help='provide your favoriate product name')
+    parser.add_argument('--top_n', type=int, default=20,
+                        help='top n product recommendations')
     return parser.parse_args()
 
 
@@ -303,24 +152,24 @@ if __name__ == '__main__':
     # get args
     args = parse_args()
     data_path = args.path
-    movies_filename = args.movies_filename
-    ratings_filename = args.ratings_filename
-    movie_name = args.movie_name
+    shopData_filename = args.shopData_filename
+    userData_filename = args.userData_filename
+    shopData_name = args.shopData_name
     top_n = args.top_n
     # initial spark
-    spark = SparkSession \
-        .builder \
-        .appName("movie recommender") \
+    spark = SparkSession
+        .builder
+        .appName("products recommender")
         .getOrCreate()
     # initial recommender system
     recommender = AlsRecommender(
         spark,
-        os.path.join(data_path, movies_filename),
+        os.path.join(data_path, shopData_filename),
         os.path.join(data_path, ratings_filename))
     # set params
     recommender.set_model_params(10, 0.05, 20)
     # make recommendations
-    recommender.make_recommendations(movie_name, top_n)
+    recommender.make_recommendations(userId, top_n)
+    # json function to print output
     # stop
     spark.stop()
-
